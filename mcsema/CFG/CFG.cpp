@@ -31,6 +31,8 @@
 #pragma clang diagnostic ignored "-Wshorten-64-to-32"
 #include <CFG.pb.h>
 #pragma clang diagnostic pop
+#include <google/protobuf/io/zero_copy_stream_impl.h>
+#include <google/protobuf/io/coded_stream.h>
 
 #include "remill/Arch/Arch.h"
 #include "remill/OS/OS.h"
@@ -260,12 +262,10 @@ static void AddXref(NativeModule *module, NativeInstruction *inst,
   }
 
   bool xref_is_external = false;
-  bool xref_is_code = false;
 
   // Does the XREF think its target is external?
   if (xref->func) {
     xref_is_external = xref->func->is_external;
-    xref_is_code = true;
 
   } else if (xref->var) {
     xref_is_external = xref->var->is_external;
@@ -392,39 +392,14 @@ static void AddXref(NativeModule *module, NativeInstruction *inst,
 }  // namespace
 
 NativeObject::NativeObject(void)
-    : forward(this),
-      ea(0),
-      name(),
-      lifted_name(),
-      is_external(false),
-      is_exported(false),
-      is_thread_local(false) {}
-
-NativeFunction::NativeFunction(void)
-    : blocks(),
-      function(nullptr) {}
+    : forward(this) {}
 
 NativeExternalFunction::NativeExternalFunction(void)
-    : is_explicit(false),
-      is_weak(false),
-      num_args(0),
-      cc(gArch->DefaultCallingConv()) {}
+    : cc(gArch->DefaultCallingConv()) {}
 
-NativeVariable::NativeVariable(void)
-    : segment(nullptr),
-      address(nullptr) {}
-
-NativeStackVariable::NativeStackVariable(void)
-    : size(0),
-      offset(0),
-      llvm_var(nullptr){}
-
-NativeExceptionFrame::NativeExceptionFrame()
-    : start_ea(0),
-      end_ea(0),
-      lp_ea(0),
-      action_index(0),
-      lp_var(nullptr){}
+NativeSegment::Entry::Entry(
+    uint64_t o_ea, uint64_t o_next_ea, NativeXref *o_xref, NativeBlob *o_blob) :
+  ea(o_ea), next_ea(o_next_ea), xref(o_xref), blob(o_blob) {}
 
 void NativeObject::ForwardTo(NativeObject *dest) const {
   if (forward != this) {
@@ -468,8 +443,11 @@ NativeModule *ReadProtoBuf(const std::string &file_name,
   CHECK(fstream.good())
       << "Unable to open CFG file " << file_name;
 
+  google::protobuf::io::IstreamInputStream pstream(&fstream);
+  google::protobuf::io::CodedInputStream cstream(&pstream);
+  cstream.SetTotalBytesLimit(512 * 1024 * 1024, -1);
   Module cfg;
-  CHECK(cfg.ParseFromIstream(&fstream))
+  CHECK(cfg.ParseFromCodedStream(&cstream))
       << "Unable to read module from CFG file " << file_name;
 
   LOG(INFO)
@@ -490,6 +468,7 @@ NativeModule *ReadProtoBuf(const std::string &file_name,
     }
     segment->lifted_name = LiftedSegmentName(cfg_segment);
     segment->is_read_only = cfg_segment.read_only();
+    segment->needs_initializer = true;
     segment->is_external = cfg_segment.is_external();
     segment->is_exported = cfg_segment.is_exported();
     segment->is_thread_local = cfg_segment.is_thread_local();

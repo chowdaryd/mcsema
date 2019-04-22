@@ -32,8 +32,6 @@
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Type.h>
 
-#include <llvm/Transforms/Scalar.h>
-
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -42,6 +40,7 @@
 #include "remill/Arch/Arch.h"
 #include "remill/Arch/Instruction.h"
 #include "remill/BC/ABI.h"
+#include "remill/BC/Compat/ScalarTransforms.h"
 #include "remill/BC/IntrinsicTable.h"
 #include "remill/BC/Lifter.h"
 #include "remill/BC/Util.h"
@@ -77,7 +76,9 @@ DEFINE_string(exception_personality_func, "__gxx_personality_v0",
               "Add a personality function for lifting exception handling "
               "routine. Assigned __gxx_personality_v0 as default for c++ ABTs.");
 
-
+DEFINE_bool(stack_protector, false, "Annotate functions so that if the bitcode "
+            "is compiled with -fstack-protector-all then the stack protection "
+            "guards will be added.");
 
 namespace mcsema {
 
@@ -128,9 +129,9 @@ static llvm::Function *GetBreakPoint(uint64_t pc) {
       func_name, gModule);
 
   // Make sure to keep this function around (along with `ExternalLinkage`).
-  func->addFnAttr(llvm::Attribute::NoInline);
   func->removeFnAttr(llvm::Attribute::ReadNone);
   func->addFnAttr(llvm::Attribute::OptimizeNone);
+  func->addFnAttr(llvm::Attribute::NoInline);
 
 #if LLVM_VERSION_NUMBER < LLVM_VERSION(3, 7)
   func->addFnAttr(llvm::Attribute::ReadOnly);
@@ -261,16 +262,50 @@ static void InlineSubFuncInvoke(llvm::BasicBlock *block,
 
 // Find an external function associated with this indirect jump.
 static llvm::Function *DevirtualizeIndirectFlow(
+    const NativeFunction *cfg_func, llvm::Function *fallback) {
+  if (cfg_func->is_external) {
+    return GetLiftedToNativeExitPoint(cfg_func);
+  } else if (auto func = gModule->getFunction(cfg_func->lifted_name)) {
+    return func;
+  } else {
+    return fallback;
+  }
+}
+
+// Find an external function associated with this indirect jump.
+static llvm::Function *DevirtualizeIndirectFlow(
     TranslationContext &ctx, llvm::Function *fallback) {
   if (ctx.cfg_inst->flow) {
     if (auto cfg_func = ctx.cfg_inst->flow->func) {
-      if (cfg_func->is_external) {
-        return GetLiftedToNativeExitPoint(cfg_func);
-      } else {
-        return gModule->getFunction(cfg_func->lifted_name);
+      return DevirtualizeIndirectFlow(cfg_func, fallback);
+    }
+  }
+
+  // This is a bit sketchy, but let's assume that it might be a thunk
+  // (e.g in the PLT). If so, then we're doing a jump through a loaded
+  // pointer, where the pointer will be fixed up with an external EA,
+  // i.e. there should be a cross-reference entry at the target pointing
+  // to the destination function.
+  if (auto mem = ctx.cfg_inst->mem) {
+    auto seg = mem->target_segment;
+
+    // In case there is a variable that has some default value, e.g. can
+    // be recognized both as xref and var on the same ea
+    // However later it can be changed to different value, so we can't
+    // devirtualize it (issue #474)
+    if (!mem->segment->is_read_only) {
+      return fallback;
+    }
+    auto target_ea_ptr_ea = mem->target_ea;
+    auto entry_it = seg->entries.find(target_ea_ptr_ea);
+    if (entry_it != seg->entries.end()) {
+      const NativeSegment::Entry &entry = entry_it->second;
+      if (entry.xref && entry.xref->func) {
+        return DevirtualizeIndirectFlow(entry.xref->func, fallback);
       }
     }
   }
+
   return fallback;
 }
 
@@ -353,7 +388,7 @@ static llvm::BasicBlock *GetOrCreateBlock(TranslationContext &ctx,
   return block;
 }
 
-
+// Create a landing pad basic block.
 static void CreateLandingPad(TranslationContext &ctx,
                              struct NativeExceptionFrame *eh_entry) {
   std::stringstream ss;
@@ -388,15 +423,17 @@ static void CreateLandingPad(TranslationContext &ctx,
     auto catch_all = false;
     unsigned long catch_all_index = 0;
 
-    for (auto index = eh_entry->type_var.size(); index > 0; index--) {
-      auto type = eh_entry->type_var[index];
+    for (auto &it : eh_entry->type_var) {
+      // Check the ttype variables are not null
+      auto type = it.second;
+      CHECK_NOTNULL(type);
       if (type->ea) {
         lpad->addClause(gModule->getGlobalVariable(type->name));
-        auto value = llvm::ConstantInt::get(dword_type, index);
+        auto value = llvm::ConstantInt::get(dword_type, type->size);
         array_value_const.push_back(value);
       } else {
         catch_all = true;
-        catch_all_index = index;
+        catch_all_index = type->size;
       }
     }
 
@@ -490,7 +527,7 @@ static void CreateLandingPad(TranslationContext &ctx,
   ctx.lp_to_block[eh_entry->lp_ea] = landing_bb;
 }
 
-
+// Lift landing pads within the function.
 static void LiftExceptionFrameLP(TranslationContext &ctx,
                                  const NativeFunction *cfg_func) {
   if (cfg_func->eh_frame.size() > 0) {
@@ -542,8 +579,8 @@ static void LiftIndirectJump(TranslationContext &ctx,
 
   if (exit_point == fallback) {
 
-    // If we have no targets, then a reasonable target turns out to be the next
-    // program counter.
+    // If we have no targets, then a reasonable target turns out to be the
+    // next program counter (if we assume that it's a jump table.).
     if (block_map.empty()) {
       block_map[inst.next_pc] = GetOrCreateBlock(ctx, inst.next_pc);
     }
@@ -863,6 +900,7 @@ static llvm::Function *LiftFunction(
   auto lifted_func = gModule->getFunction(cfg_func->lifted_name);
   CHECK(nullptr != lifted_func)
       << "Could not find declaration for " << cfg_func->lifted_name;
+  cfg_func->function = lifted_func;
 
   // This can happen due to deduplication of functions during the
   // CFG decoding process. In practice, though, that only really
@@ -890,6 +928,10 @@ static llvm::Function *LiftFunction(
   lifted_func->addFnAttr(llvm::Attribute::NoInline);
   lifted_func->setVisibility(llvm::GlobalValue::DefaultVisibility);
 
+  if (FLAGS_stack_protector) {
+    lifted_func->addFnAttr(llvm::Attribute::StackProtectReq);
+  }
+
   TranslationContext ctx;
   std::unique_ptr<remill::InstructionLifter> lifter(
       new InstructionLifter(intrinsics.get(), ctx));
@@ -915,7 +957,8 @@ static llvm::Function *LiftFunction(
   // Allocate the stack variable recovered in the function
   auto entry_block = ctx.ea_to_block[cfg_func->ea];
   AllocStackVars(entry_block, cfg_func);
-  // Lift the landing pad if there are exception frames recovered
+
+  // Lift the landing pad if there are exception frames recovered.
   LiftExceptionFrameLP(ctx, cfg_func);
 
   llvm::BranchInst::Create(ctx.ea_to_block[cfg_func->ea],

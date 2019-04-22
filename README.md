@@ -1,4 +1,9 @@
+
+
 # McSema [![Slack Chat](http://empireslacking.herokuapp.com/badge.svg)](https://empireslacking.herokuapp.com/)
+<p align="center">
+     <img src="docs/images/mcsema_logo.png" />
+</p>
 
 McSema is an executable lifter. It translates ("lifts") executable binaries from native machine code to LLVM bitcode. LLVM bitcode is an [intermediate representation](https://en.wikipedia.org/wiki/Intermediate_representation) form of a program that was originally created for the [retargetable LLVM compiler](https://llvm.org), but which is also very useful for performing program analysis methods that would not be possible to perform on an executable binary directly.
 
@@ -6,7 +11,7 @@ McSema enables analysts to find and retroactively harden binary programs against
 
 McSema supports lifting both Linux (ELF) and Windows (PE) executables, and understands most x86 and amd64 instructions, including integer, X87, MMX, SSE and AVX operations. AARCH64 (ARMv8) instruction support is in active development.
 
-Using McSema is a two-step process: control flow recovery, and instruction translation. Control flow recovery is performed using the `mcsema-disass` tool, which relies on IDA Pro to disassemble a binary file and produce a control flow graph. Instruction translation is then performed using the `mcsema-lift` tool, which converts the control flow graph into LLVM bitcode. Under the hood, the instruction translation capability of `mcsema-lift` is implemented in the [`remill` library](https://github.com/trailofbits/remill). The development of `remill` was a result of refactoring and improvements to McSema, and was first introduced with McSema version 2.0.0. Read more about `remill` [here](https://github.com/trailofbits/remill).
+Using McSema is a two-step process: control flow recovery, and instruction translation. Control flow recovery is performed using the `mcsema-disass` tool, which relies on IDA Pro, Binary Ninja, or DynInst to disassemble a binary file and produce a control flow graph. Instruction translation is then performed using the `mcsema-lift` tool, which converts the control flow graph into LLVM bitcode. Under the hood, the instruction translation capability of `mcsema-lift` is implemented in the [`remill` library](https://github.com/trailofbits/remill). The development of `remill` was a result of refactoring and improvements to McSema, and was first introduced with McSema version 2.0.0. Read more about `remill` [here](https://github.com/trailofbits/remill).
 
 McSema and `remill` were developed and are maintained by Trail of Bits, funded by and used in research for DARPA and the US Department of Defense.
 
@@ -39,6 +44,25 @@ Why would anyone translate binaries *back* to bitcode?
 
 * **Write one set of analysis tools**. Lifting to LLVM IR means that one set of analysis tools can work on both the source and the binary. Maintaining a single set of tools saves development time and effort, and allows for a single set of better tools.
 
+## Comparison with other machine code to LLVM bitcode lifters
+|   | McSema | [dagger](https://github.com/repzret/dagger) | [llvm-mctoll](https://github.com/Microsoft/llvm-mctoll) | [retdec](https://github.com/avast-tl/retdec) | [reopt](https://github.com/GaloisInc/reopt) | [rev.ng](https://github.com/revng/revamb) | [bin2llvm](https://github.com/cojocar/bin2llvm) | [fcd](https://github.com/zneak/fcd) | [RevGen](https://github.com/S2E/tools/tree/master/tools) | [Fracture](https://github.com/draperlaboratory/fracture) | [libbeauty](https://github.com/jcdutton/libbeauty) |
+|  ------ | ------ | ------ | ------ | ------ | ------ | ------ | ------ | ------ | ------ | ------ | ------ |
+|  Actively maintained? | Yes | No | Yes | Yes | Yes | No | Maybe | Maybe | Maybe | No | Yes |
+|  Commercial support available? | Yes | No | No | No | Maybe | No | No | No | No | Maybe | No |
+|  LLVM versions | 3.5 - current | 5 | current | 3.9.1 | 3.8 | 3.8 | 3.2 | 4 | 3.9 | 3.4 | 6 |
+|  Builds with CI? | Yes | No | No | Yes | No | No | Yes | Maybe | Maybe | No | No |
+|  32-bit architectures | x86 | x86 | ARM | x86, ARM, MIPS, PIC32, PowerPC |  | ARM, MIPS | S2E | S2E | S2E | ARM, x86 |  |
+|  64-bit architectures | x86-64, AArch64 | x86-64 | x86-64 |  | x86-64 | x86-64 |  | S2E | S2E | PowerPC | x86-64 |
+|  Control-flow recovery | IDA Pro, Binary Ninja, DynInst | Ad-hoc | Ad-hoc | Ad-hoc | Ad-hoc | Ad-hoc | Ad-hoc | Ad-hoc | McSema | Ad-hoc | Ad-hoc |
+|  File formats | ELF, PE | ELF, Mach-O |  | ELF, PE, Mach-O, COFF, AR, Intel HEX, Raw | ELF | ELF | ELF |  | ELF, PE | ELF, Mach-O (maybe) | ELF |
+|  Bitcode is executable? | Yes | Yes | Yes | Yes | Yes | Yes | No | No | CGC | No | No |
+|  C++ exceptions suport? | Yes | No | No | No | No | Indirectly | No | No | No | No | Maybe |
+|  Lifts stack variables? | Yes | No | Maybe | Yes | No | No | No | Yes | No | No | Maybe |
+|  Lifts global variables? | Yes | Maybe | Yes | Yes | No | Maybe | No | No | No | Yes | Maybe |
+|  Has a test suite? | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | Yes | No |
+
+**Note:** We label some architectures as "S2E" to mean any architecture supported by the S2E system. A system using "McSema" for control-flow recovery (e.g. RevGen) uses McSema's CFG.proto format for recovering control-flow. In the case of RevGen, only bitcode produced from DARPA Cyber Grand Challenge (CGC) binaries is executable.
+
 ## Dependencies
 
 | Name | Version | 
@@ -58,6 +82,26 @@ Why would anyone translate binaries *back* to bitcode?
 | [IDA Pro](https://www.hex-rays.com/products/ida) | 6.7+ |
 
 ## Getting and building the code
+
+### Docker
+
+#### Step 1: Download Dockerfile
+
+`wget https://raw.githubusercontent.com/trailofbits/mcsema/master/tools/Dockerfile`
+
+#### Step 2: Add your disassembler
+
+Currently IDA and BinaryNinja are supported for control-flow recovery, it's left as an exercise to the reader to install your disassembler of choice, but an example of installing BinaryNinja is provided (remember for Docker that paths need to be relative to where you built from):
+```
+ADD local-relative/path/to/binaryninja/ /root/binaryninja/
+ADD local-relative/path/to/.binaryninja/ /root/.binaryninja/ # <- Make sure there's no `lastrun` file
+RUN /root/binaryninja/scripts/linux-setup.sh
+```
+
+#### Step 3: Build & Run Dockerfile
+
+This will build the container for you and run it with your local directory mounted into the container (at /home/user/local) such that your work in the container is saved locally: 
+`docker build -t=mcsema . && docker run --rm -it --ipc=host -v "${PWD}":/home/user/local mcsema`
 
 ### On Linux
 
@@ -176,6 +220,85 @@ Once installed, you may use `mcsema-disass` for disassembling binaries, and `mcs
 
 In order to verify that McSema works correctly as built, head on over to [the documentation on integration tests](tests/MakingTests.md). Check that you can run the tests and that they pass.
 
+### On Windows
+#### Step 1: Installing the toolchain
+**Visual Studio**
+1. Download the "Build Tools for Visual Studio 2017" installer from the following page: https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2017
+2. Run the setup and select "Visual C++ build tools"
+
+**LLVM**
+1. Get the LLVM 7.0.1 (x64) installer from the LLVM download page: http://releases.llvm.org
+2. Do **NOT** enable "Add to PATH"
+
+**Python**
+1. Get the latest Python 2.7 (X64) installer from the official download page: https://www.python.org/downloads/windows/
+2. Enable "Add to PATH" when possible
+
+**CMake**
+1. Download the CMake (x64) installer from https://cmake.org/download
+2. Enable "Add to PATH" when possible
+
+#### Step 2: Obtaining the source code
+```
+git clone https://github.com/trailofbits/remill.git --depth=1
+git clone https://github.com/trailofbits/mcsema.git --depth=1 remill/tools/mcsema
+```
+
+Note that for production usage you should always use a specific remill commit (`remill/tools/mcsema/.remill_commit_id`) when building mcsema. At the time of writing, it is however best to use HEAD (or at least make sure that commit `e7795be` is present in the remill branch).
+
+```
+cd remill
+git fetch --unshallow
+git checkout -b production `cat tools/mcsema/.remill_commit_id`
+```
+
+#### Step 3: Dependencies
+First, set up LLVM Toolchain Support for Visual Studio 2017 Build Tools. There is a script in remill to automate this for you.
+```
+cd C:\Projects\remill\scripts\windows (or wherever you cloned remill)
+powershell -nologo -executionpolicy bypass -File llvm_toolchain_vs2017.ps1
+```
+
+Next, its time to fetch library dependencies. You can either build them yourself using our [cxx-common](https://github.com/trailofbits/cxx-common) dependency manager or download a pre-built package.
+
+There are two versions of LLVM used by remill and mcsema. One version (currently 7.0.1) builds remill and mcsema. Another version (currently 5.0.1) is used to build the translation semantics. 
+
+On Windows, only the LLVM 5.0.1 package is supported for building semantics. If you build it yourself, use the Visual Studio 2017 Win64 generator with the LLVM 5.0.1 toolchain. The cxx-common script will automatically take care of this requirement.
+
+Binaries (extract to C:\Projects\tob_libraries)
+* [LLVM 5](https://s3.amazonaws.com/cxx-common/libraries-llvm50-windows10-amd64.7z)
+
+#### Step 4: Building
+Make sure to always execute the `vcvars64.bat` script from the "x64 Native Tools Command Prompt": `C:\Program Files (x86)\Microsoft Visual Studio\2017\BuildTools\VC\Auxiliary\Build\vcvars64.bat`.
+
+```
+mkdir remill_build
+cd remill_build
+
+cmake -G "Visual Studio 15 2017" -T llvm -A x64 -DCMAKE_BUILD_TYPE=Release -DLIBRARY_REPOSITORY_ROOT=C:\Projects\tob_libraries -DCMAKE_INSTALL_PREFIX=C:\ ..\remill
+cmake --build . --config Release -- /maxcpucount:4
+```
+
+If you are using a recent CMake version (> 3.13) you can also use the newly introduced cross-platform `-j` parameter:
+
+```
+cmake --build . --config Release -j 4
+```
+
+#### Step 5: Installing
+```
+cmake --build . --config Release --target install
+```
+
+You should now have the following directories: C:\mcsema, C:\remill.
+
+Add the following folders to your PATH environment variable:
+* C:\remill\bin
+* C:\mcsema\Scripts
+* C:\mcsema\bin
+
+Also update your PYTHONPATH: C:\mcsema\Lib\site-packages
+
 ## Additional Documentation
 
 * [McSema command line reference](docs/CommandLineReference.md)
@@ -207,4 +330,4 @@ McSema's goal is binary to bitcode translation. Accurate disassembly and control
 
 ### I'm a student and I'd like to contribute to McSema: how can I help
 
-We would love to take you on as an intern to help improve McSema. We have several project ideas labelled `intern_project` in [the issues tracker](https://github.com/trailofbits/mcsema/issues?q=is%3Aissue+is%3Aopen+label%3Aintern_project). You are not limited to those items: if you think of a great feature you want in McSema, let us know and we will sponsor it. Simply contact us on our [Slack channel](https://empireslacking.herokuapp.com/) or via mcsema@trailofbits.com and let us know what you'd want to work on and why.
+We would love to take you on as an intern to help improve McSema. We have several project ideas labelled [`intern project`](https://github.com/trailofbits/mcsema/labels/intern%20project), as well as having smaller scale to-dos labelled under [`good first issue`](https://github.com/trailofbits/mcsema/labels/good%20first%20issue) and [`help wanted`](https://github.com/trailofbits/mcsema/labels/help%20wanted) on our issue tracker. You are not limited to those items: if you think of a great feature you want in McSema, let us know and we will sponsor it. Simply contact us on our [Slack channel](https://empireslacking.herokuapp.com/) or via mcsema@trailofbits.com and let us know what you'd want to work on and why.

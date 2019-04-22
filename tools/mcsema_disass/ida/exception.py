@@ -30,9 +30,8 @@ from collections import namedtuple
 # Bring in utility libraries.
 from util import *
 
-frame_entry = namedtuple('frame_entry', ['cs_start', 'cs_end', 'cs_lp', 'cs_action'])
+frame_entry = namedtuple('frame_entry', ['cs_start', 'cs_end', 'cs_lp', 'cs_action', 'action_list'])
 _FUNC_UNWIND_FRAME_EAS = set()
-_FUNC_LSDA_ENTRIES = dict()
 
 _EXCEPTION_BLOCKS_EAS = dict()
 
@@ -60,11 +59,6 @@ class EHBlocks(object):
   def __init__(self, start_ea, end_ea):
     self.start_ea = start_ea
     self.end_ea = end_ea
-
-def sign_extn(x, b):
-  m = 1 << (b - 1)
-  x = x & ((1 << b) - 1)
-  return (x ^ m) - m
 
 def make_array(ea, size):
   if ea != idc.BADADDR and ea != 0:
@@ -129,19 +123,19 @@ def read_enc_value(ea, enc):
     val = read_word(ea)
     ea += 2
     if fmt == DW_EH_PE_sdata2:
-      val = sign_extn(val, 16)
+      val = sign_extend(val, 16)
       
   elif fmt in [DW_EH_PE_sdata4, DW_EH_PE_udata4]:
     val = read_dword(ea)
     ea += 4
     if fmt == DW_EH_PE_sdata4:
-      val = sign_extn(val, 32)
+      val = sign_extend(val, 32)
       
   elif fmt in [DW_EH_PE_sdata8, DW_EH_PE_udata8]:
     val = read_qword(ea)
     ea += 8
     if f == DW_EH_PE_sdata8:
-      val = sign_extn(val, 64)
+      val = sign_extend(val, 64)
       
   else:
     DEBUG("{0:x}: don't know how to handle {1:x}".format(start, enc))
@@ -164,46 +158,18 @@ def read_enc_value(ea, enc):
 
   return val, ea
 
-def _create_frame_entry(start = None, end = None, lp = None, action = None):
-    return frame_entry(start, end, lp, action)
+def _create_frame_entry(start = None, end = None, lp = None, action = None, act_list = None):
+    return frame_entry(start, end, lp, action, act_list)
 
-def format_lsda_action(action_tbl, type_addr, type_enc, act_id):
+def format_lsda_actions(action_tbl, act_ea, type_addr, type_enc, act_id):
   """ Recover the exception actions and type info
   """
   action_list = []
   if action_tbl == idc.BADADDR:
     return
 
-  act_ea = action_tbl + act_id - 1
-  ar_filter,ea2 = read_enc_value(act_ea, DW_EH_PE_sleb128)
-  ar_disp,  ea3 = read_enc_value(ea2, DW_EH_PE_sleb128)
-  
-  if ar_filter > 0:
-    type_slot = type_addr - ar_filter * enc_size(type_enc)
-    type_ea, eatmp = read_enc_value(type_slot, type_enc)
-    DEBUG("catch type typeinfo = {:x} {}".format(type_ea, get_symbol_name(type_ea)))
-
-  if ar_disp == 0:
-    return
-
-  next_ea = ea2 + ar_disp
-  next_act = next_ea - act_ea + act_id
-
-  #action_list.append((ar_disp, ar_filter, type_ea))
-  #DEBUG("ea {:x}: ar_disp[{}]: {} ({:x})".format(act_ea, act_id, ar_disp, ar_filter))
-  #return action_list
-
-def format_lsda_actions(action_tbl, actions, type_addr, type_enc, act_id):
-  """ Recover the exception actions and type info
-  """
-  action_list = []
-  if action_tbl == idc.BADADDR:
-    return
-
-  DEBUG("No of Actions : {0}".format(len(actions)))
-  while len(actions):
-    act_id = actions.pop()
-    act_ea = action_tbl + act_id - 1
+  DEBUG("start action ea : {:x}".format(act_ea))
+  while True:
     ar_filter,ea2 = read_enc_value(act_ea, DW_EH_PE_sleb128)
     ar_disp,  ea3 = read_enc_value(ea2, DW_EH_PE_sleb128)
   
@@ -211,17 +177,14 @@ def format_lsda_actions(action_tbl, actions, type_addr, type_enc, act_id):
       type_slot = type_addr - ar_filter * enc_size(type_enc)
       type_ea, eatmp = read_enc_value(type_slot, type_enc)
       DEBUG("catch type typeinfo = {:x} {} {}".format(type_ea, get_symbol_name(type_ea), ar_filter))
-      if (ar_disp, ar_filter, type_ea) not in action_list:
-        action_list.append((ar_disp, ar_filter, type_ea))
+      action_list.append((ar_disp, ar_filter, type_ea))
 
+    #DEBUG(" format_lsda_actions ea {:x}: ar_disp[{}]: {} ({:x})".format(act_ea, act_id, ar_disp, ar_filter))
     if ar_disp == 0:
-      continue
+      break
 
-    next_ea = ea2 + ar_disp
-    next_act = next_ea - act_ea + act_id
-    actions.append(next_act)
+    act_ea = ea2 + ar_disp
 
-  #DEBUG("ea {:x}: ar_disp[{}]: {} ({:x})".format(act_ea, act_id, ar_disp, ar_filter))
   return action_list
 
 def create_block_entries(start_ea, heads):
@@ -247,7 +210,7 @@ def create_block_entries(start_ea, heads):
 def format_lsda(lsda_ptr, start_ea, range = None,  sjlj = False):
   """  Recover the language specific data area
   """
-  lsda_entries = set()
+  lsda_entries = list()
   heads = set()
   lpstart_enc, ea = read_byte(lsda_ptr), lsda_ptr + 1
   if lpstart_enc != DW_EH_PE_omit:
@@ -311,16 +274,17 @@ def format_lsda(lsda_ptr, start_ea, range = None,  sjlj = False):
       DEBUG("Landing pad for {0:x}..{1:x}".format(cs_start, cs_start + cs_len))
       DEBUG_POP()
 
-    lsda_entries.add(_create_frame_entry(cs_start, cs_start + cs_len, cs_lp, cs_action != 0))
-    #lsda_entries.add(_create_frame_entry(cs_start, cs_start + cs_len, cs_lp, cs_action))
+    if cs_action != 0:
+      action_offset = action_tbl + cs_action - 1
+      action_list = format_lsda_actions(action_tbl, action_offset, type_addr, type_enc, cs_action)
+
+    lsda_entries.append(_create_frame_entry(cs_start, cs_start + cs_len, cs_lp, cs_action, action_list))
+
     DEBUG("ea {:x}: cs_action[{}] = {}".format(act_ea, i, cs_action))
     i += 1
 
-  #if cs_action != 0:
-  action_list = format_lsda_actions(action_tbl, actions, type_addr, type_enc, cs_action)
-
   create_block_entries(start_ea, sorted(heads))
-  _FUNC_LSDA_ENTRIES[start_ea] = (lsda_entries, action_list)
+  FUNC_LSDA_ENTRIES[start_ea] = lsda_entries
 
 class AugmentationData:
   def __init__(self):
@@ -445,10 +409,12 @@ def recover_exception_table():
       recover_frame_entries(seg_ea)
       break
 
+  recover_rtti()
+
 def recover_exception_entries(F, func_ea):
-  has_unwind_frame = func_ea in _FUNC_LSDA_ENTRIES.keys()
+  has_unwind_frame = func_ea in FUNC_LSDA_ENTRIES.keys()
   if has_unwind_frame:
-    lsda_entries, action_list = _FUNC_LSDA_ENTRIES[func_ea]
+    lsda_entries = FUNC_LSDA_ENTRIES[func_ea]
 
     for entry in lsda_entries:
       EH = F.eh_frame.add()
@@ -456,9 +422,9 @@ def recover_exception_entries(F, func_ea):
       EH.start_ea = entry.cs_start
       EH.end_ea = entry.cs_end
       EH.lp_ea = entry.cs_lp
-      EH.action = entry.cs_action
+      EH.action = entry.cs_action != 0
 
-      for ar_disp, ar_filter, type_ea  in action_list:
+      for ar_disp, ar_filter, type_ea  in entry.action_list:
         AC = EH.ttype.add()
         AC.ea = type_ea
         AC.name = get_symbol_name(type_ea)
@@ -473,9 +439,9 @@ def fix_function_bounds(min_ea, max_ea):
   return min_ea, max_ea
 
 def get_exception_landingpad(F, insn_ea):
-  has_lp = F.ea in _FUNC_LSDA_ENTRIES.keys()
+  has_lp = F.ea in FUNC_LSDA_ENTRIES.keys()
   if has_lp:
-    lsda_entries, action_list = _FUNC_LSDA_ENTRIES[F.ea]
+    lsda_entries = FUNC_LSDA_ENTRIES[F.ea]
     for entry in lsda_entries:
       if insn_ea >= entry.cs_start and insn_ea < entry.cs_end:
         return entry.cs_lp
@@ -487,3 +453,101 @@ def get_exception_chunks(sub_ea):
     block_set = _EXCEPTION_BLOCKS_EAS[sub_ea]
     for block in block_set:
       yield block.start_ea, block.end_ea
+
+
+""" Recover the RTTI information which can't be detected by IDA 6.9
+"""
+
+typeinfo_names = [
+ "_ZTVSt9type_info",
+ "_ZTVN10__cxxabiv117__class_type_infoE",
+ "_ZTVN10__cxxabiv120__si_class_type_infoE",
+ "_ZTVN10__cxxabiv121__vmi_class_type_infoE",
+]
+
+EXTERNAL_NAMES = ("@@GLIBCXX_", "@@CXXABI_")
+
+def get_stripped_name(name):
+  for en in EXTERNAL_NAMES:
+    if en in name:
+      name = name[:name.find(en)]
+  return name
+
+def _create_reference_object(name, ea, offset):
+  return dict(name=name, addr=ea, offset=offset)
+
+def get_alternative_symbol_name(ea):
+  comment = idc.GetCommentEx(ea, 0) or ""
+  for comment_line in comment.split("\n"):
+    comment_line = comment_line.replace(";", "").strip()
+    if not comment_line:
+      continue
+    mstr = comment_line.split("'")
+    if 3 <= len(mstr):
+      return mstr[1] + "'" + mstr[2]
+  return None
+
+def convert_to_bytes(value):
+  is64 = get_address_size_in_bytes() == 8
+  if is64:
+    sv = struct.pack("<Q", value)
+  else:
+    sv = struct.pack("<I", value)
+  return " ".join("%02X" % ord(c) for c in sv)
+
+def first(val):
+  return idc.FindBinary(0, idc.SEARCH_CASE|idc.SEARCH_DOWN, convert_to_bytes(val))
+
+def next(val, ref):
+  return idc.FindBinary(ref+1, idc.SEARCH_CASE|idc.SEARCH_DOWN, convert_to_bytes(val))
+
+def find_xrefs(addr):
+  lrefs = list(idautils.DataRefsTo(addr))
+  if len(lrefs) == 0:
+    lrefs = list(idautils.refs(addr, first, next))
+
+  lrefs = [r for r in lrefs if not idc.isCode(idc.GetFlags(r))]
+  return lrefs
+
+def get_type_info(ea):
+  tis = read_pointer(ea + get_address_size_in_bytes())
+  if is_invalid_ea(tis):
+    return idc.BADADDR
+  name = idc.GetString(tis)
+  if name == None or len(name) == 0:
+    return idc.BADADDR, name
+
+  ea2 = ea + 2*get_address_size_in_bytes()
+  return ea2, name
+
+def get_si_type_info(ea):
+  ea2, name = get_type_info(ea)
+  pbase = read_pointer(ea2)
+  RTTI_REFERENCE_TABLE[ea2] = _create_reference_object(get_alternative_symbol_name(pbase), pbase, 0)
+  ea2 += get_address_size_in_bytes()
+  return ea2
+
+def get_typeinfo_refs(name, ea):
+  if ea == idc.BADADDR:
+    return
+
+  ea2 = ea
+  if idaapi.is_spec_ea(ea2):
+    xrefs = find_xrefs(ea2)
+    ea2 += get_address_size_in_bytes()*2
+    xrefs.extend(find_xrefs(ea2))
+  else:
+    ea2 += get_address_size_in_bytes()*2
+    xrefs = find_xrefs(ea2)
+
+  for x in xrefs:
+    if not is_invalid_ea(x):
+      value = read_pointer(x)
+      offset = value - ea if value > ea else 0
+      RTTI_REFERENCE_TABLE[x] = _create_reference_object(name, ea, offset)
+      ea3 = get_si_type_info(x)
+
+def recover_rtti():
+  for index, ordinal, ea, name in idautils.Entries():
+    if get_stripped_name(name) in typeinfo_names:
+      get_typeinfo_refs(name, ea)

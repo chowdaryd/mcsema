@@ -83,7 +83,7 @@ static bool IsZero(const NativeSegment *cfg_seg) {
       return false;
     }
   }
-  return false;
+  return true;
 }
 
 // The type of the segment is a packed structure that is a sequence of opaque
@@ -137,22 +137,47 @@ static llvm::GlobalValue::ThreadLocalMode ThreadLocalMode(
   }
 }
 
-// Declare a data segment, and return a global value pointing to that segment.
-static llvm::GlobalVariable *DeclareSegment(const NativeSegment *cfg_seg) {
+static llvm::GlobalVariable *GlobalVariable(
+    const NativeSegment *cfg_seg, std::string lifted_name) {
   auto seg_type = GetSegmentType(cfg_seg);
-  auto seg = new llvm::GlobalVariable(
+
+  auto seg_var = new llvm::GlobalVariable(
       *gModule, seg_type, cfg_seg->is_read_only,
       llvm::GlobalValue::InternalLinkage, nullptr,
-      cfg_seg->lifted_name, nullptr, ThreadLocalMode(cfg_seg));
+      lifted_name, nullptr, ThreadLocalMode(cfg_seg));
 
   if (cfg_seg->is_exported) {
-    seg->setLinkage(llvm::GlobalValue::ExternalLinkage);
-    seg->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
+    seg_var->setLinkage(llvm::GlobalValue::ExternalLinkage);
   }
 
-  cfg_seg->seg_var = seg;
+  return seg_var;
+}
 
-  return seg;
+// Declare a data segment, and return a global value pointing to that segment.
+static void DeclareSegment(const NativeSegment *cfg_seg) {
+  cfg_seg->seg_var = gModule->getGlobalVariable(cfg_seg->lifted_name);
+
+  if (cfg_seg->seg_var) {
+    // If the variable is exported and zero initialized (not having xrefs),
+    // No need to initialize these variables
+    if (cfg_seg->is_exported && cfg_seg->seg_var->hasExternalLinkage()) {
+      cfg_seg->needs_initializer = !IsZero(cfg_seg);
+    } else {
+      // If there is a variable with the same name, rename the variable
+      // and set the needs_initializer flag;
+      std::stringstream ss;
+      ss << "internal_" << cfg_seg->lifted_name;
+      cfg_seg->seg_var = GlobalVariable(cfg_seg, ss.str());
+
+      LOG(ERROR)
+          << "Segment variable '" << cfg_seg->lifted_name
+          << "' was already defined";
+
+      cfg_seg->needs_initializer = true;
+    }
+  } else {
+    cfg_seg->seg_var = GlobalVariable(cfg_seg, cfg_seg->lifted_name);
+  }
 }
 
 // Declare named variables that point into the data segment. The program being
@@ -192,7 +217,13 @@ static llvm::Function *CreateMcSemaInitFiniImpl(
       llvm::GlobalValue::InternalLinkage,
       func_name, gModule);
 
-  llvm::IRBuilder<> ir(llvm::BasicBlock::Create(*gContext, "", func));
+  auto bool_type = llvm::Type::getInt1Ty(*gContext);
+  auto check_var = new llvm::GlobalVariable(
+      bool_type, false, llvm::GlobalValue::InternalLinkage);
+  check_var->setInitializer(llvm::Constant::getNullValue(bool_type));
+
+  auto entry = llvm::BasicBlock::Create(*gContext, "", func);
+  llvm::IRBuilder<> ir(entry);
   ir.CreateRetVoid();
 
   auto i32_type = llvm::Type::getInt32Ty(*gContext);
@@ -250,6 +281,11 @@ static llvm::Function *GetOrCreateMcSemaConstructor(void) {
   if (!gInitFunc) {
     gInitFunc = CreateMcSemaInitFiniImpl(
         "__mcsema_constructor", "llvm.global_ctors");
+
+    // Make sure that the `__mcsema_constructor` calls the xref initializer
+    // as it's first thing.
+    llvm::IRBuilder<> ir(&(gInitFunc->front().front()));
+    ir.CreateCall(GetOrCreateMcSemaInitializer());
   }
   return gInitFunc;
 }
@@ -281,9 +317,10 @@ static llvm::Function *GetOrCreateMcSemaDestructor(void) {
 // handle them by emulating this runtime initialization. We create a special
 // constructor function of our own, `__mcsema_constructor`, that will contain
 // code that can do these initializations.
-static void LazyInitXRef(const NativeXref *xref, llvm::Type *extern_addr_type) {
-  auto init_func = GetOrCreateMcSemaConstructor();
-  llvm::BasicBlock *block = &init_func->front();
+static void LazyInitXRef(const NativeXref *xref, llvm::Type *extern_addr_type,
+                         llvm::Constant *target_addr_const) {
+  auto init_func = GetOrCreateMcSemaInitializer();
+  llvm::BasicBlock *block = &init_func->back();
   llvm::IRBuilder<> ir(block);
   ir.SetInsertPoint(&block->front());
 
@@ -296,11 +333,19 @@ static void LazyInitXRef(const NativeXref *xref, llvm::Type *extern_addr_type) {
     seg->setConstant(false);
   }
 
-  llvm::Value *target_addr = xref->var->address;
+  if (!target_addr_const || target_addr_const->isNullValue()) {
+    LOG_IF(FATAL, !xref->var)
+        << "Cannot perform lazy relocation of non-variable cross-reference "
+        << "from " << std::hex << xref->ea << " to " << xref->target_ea
+        << std::dec << " (" << xref->target_name << ")";
+    target_addr_const = xref->var->address;
+  }
+
+  llvm::Value *target_addr = target_addr_const;
 
   switch (xref->fixup_kind) {
     case NativeXref::kAbsoluteFixup: {
-      CHECK(!xref->var->is_thread_local)
+      CHECK(!xref->var || !xref->var->is_thread_local)
           << "Cannot do absolute fixup from " << std::hex << xref->ea
           << " to thread-local variable " << xref->target_name << " at "
           << std::hex << xref->target_ea;
@@ -309,6 +354,11 @@ static void LazyInitXRef(const NativeXref *xref, llvm::Type *extern_addr_type) {
     }
 
     case NativeXref::kThreadLocalOffsetFixup: {
+      CHECK(xref->var != nullptr)
+          << "Non-variable thread-local cross-reference from "
+          << std::hex << xref->ea << " to " << xref->target_ea << std::dec
+          << " (" << xref->target_name << ")";
+
       CHECK(xref->var->is_thread_local)
           << "Cannot do thread-local fixup from " << std::hex << xref->ea
           << " to non-thread-local variable " << xref->target_name << " at "
@@ -410,8 +460,8 @@ static llvm::Constant *FillDataSegment(const NativeSegment *cfg_seg,
               << "Adding runtime initializer for cross reference to variable "
               << cfg_var->name << " at " << std::hex << cfg_seg_entry.first
               << " in segment " << cfg_seg->name;
-          LazyInitXRef(xref, val_type);
-          val = llvm::ConstantInt::get(gWordType, 0);
+          LazyInitXRef(xref, val_type, val);
+          val = llvm::Constant::getNullValue(gWordType);
         } else {
           val = cfg_var->address;
         }
@@ -429,8 +479,17 @@ static llvm::Constant *FillDataSegment(const NativeSegment *cfg_seg,
       // Scale and add the value in. We need to fit it to its original width.
       if (val_size > gArch->address_size) {
         val = llvm::ConstantExpr::getZExt(val, val_type);
+
+      // Pointer truncation is generating the weird code for static
+      // initialization of segment variables which is causing problem
+      // during recompilations. Use Lazy initialization of the variable
+      //    segXXXX__gcc_except_table
+      // Wrongly generated static initializer looks like following:
+      //    .long   _ZTI12out_of_range&-1
+      //    .long   _ZTI17special_condition&-1
       } else if (val_size < gArch->address_size) {
-        val = llvm::ConstantExpr::getTrunc(val, val_type);
+        LazyInitXRef(xref, val_type, val);
+        val = llvm::ConstantInt::getNullValue(val_type);
       }
 
       CHECK(val->getType() == entry_type)
@@ -447,34 +506,113 @@ static llvm::Constant *FillDataSegment(const NativeSegment *cfg_seg,
 }
 
 // Fill all the data segments in a given region.
-static void FillSegment(llvm::GlobalVariable *seg,
-                        const NativeSegment *cfg_seg) {
-  auto seg_type = llvm::dyn_cast<llvm::StructType>(remill::GetValueType(seg));
-  seg->setInitializer(FillDataSegment(cfg_seg, seg_type));
+static void FillSegment(const NativeSegment *cfg_seg) {
+  auto seg = cfg_seg->seg_var;
+  if (cfg_seg->needs_initializer) {
+    CHECK_NOTNULL(seg);
+    auto seg_type = llvm::dyn_cast<llvm::StructType>(remill::GetValueType(seg));
+
+    // This might be null if there are two lifted variables with same name and one of them is exported
+    // and the exported variable is having xrefs or notnull.
+    CHECK_NOTNULL(seg_type);
+    seg->setInitializer(FillDataSegment(cfg_seg, seg_type));
+  }
 }
 
 }  // namespace
 
-void AddDataSegments(const NativeModule *cfg_module) {
+llvm::Function *GetOrCreateMcSemaInitializer(void) {
+  static llvm::Function *gInitFunc = nullptr;
+  if (!gInitFunc) {
+    LOG(INFO)
+          << "Creating __mcsema_early_init function to pre-initialize runtime.";
 
-  std::vector<llvm::GlobalVariable *> seg_vars;
+    gInitFunc = llvm::Function::Create(
+        llvm::FunctionType::get(llvm::Type::getVoidTy(*gContext), false),
+        llvm::GlobalValue::InternalLinkage,
+        "__mcsema_early_init", gModule);
+
+    auto bool_type = llvm::Type::getInt1Ty(*gContext);
+    auto check_var = new llvm::GlobalVariable(
+        *gModule, bool_type, false, llvm::GlobalValue::InternalLinkage,
+        llvm::Constant::getNullValue(bool_type));
+
+    auto entry = llvm::BasicBlock::Create(*gContext, "", gInitFunc);
+    auto already_done = llvm::BasicBlock::Create(*gContext, "", gInitFunc);
+    auto lazy_xref = llvm::BasicBlock::Create(*gContext, "", gInitFunc);
+
+    llvm::IRBuilder<> ir(entry);
+
+    auto guard = ir.CreateLoad(check_var, true);
+    ir.CreateCondBr(guard, already_done, lazy_xref);
+
+    ir.SetInsertPoint(already_done);
+    ir.CreateRetVoid();
+
+    // Last basic block will have lazy xrefs injected into it.
+    ir.SetInsertPoint(lazy_xref);
+    ir.CreateStore(llvm::ConstantInt::get(bool_type, 1), check_var, true);
+    ir.CreateRetVoid();
+  }
+  return gInitFunc;
+}
+
+void DeclareDataSegments(const NativeModule *cfg_module) {
   for (auto cfg_seg_entry : cfg_module->segments) {
-    seg_vars.push_back(DeclareSegment(cfg_seg_entry.second));
+    DeclareSegment(cfg_seg_entry.second);
   }
 
   DeclareVariables(cfg_module);
+}
 
-  unsigned i = 0;
+void DefineDataSegments(const NativeModule *cfg_module) {
   for (auto cfg_seg_entry : cfg_module->segments) {
-    FillSegment(seg_vars[i++], cfg_seg_entry.second);
+    FillSegment(cfg_seg_entry.second);
   }
+}
+
+// Try to deduce what constructor and destructor functions should be used
+bool DetectAndSetInitFiniCode(const NativeModule *cfg_module) {
+  // init_fini_pairs.size % 2 == 0 must hold
+  // constructor is first
+  std::vector<std::pair<std::string, bool>> init_fini_pairs = {
+    // Stripped binaries
+    {"init", false},
+    {"fini", false},
+
+    // Not stripped binaries
+    {"__libc_csu_init", false},
+    {"__libc_csu_fini", false},
+  };
+
+  for (const auto &cfg_func : cfg_module->ea_to_func) {
+    for (auto &init_fini_func : init_fini_pairs) {
+      if (cfg_func.second->name ==  init_fini_func.first) {
+        init_fini_func.second = true;
+      }
+    }
+  }
+
+  for (auto i = 0U; i < init_fini_pairs.size(); i += 2) {
+    if (init_fini_pairs[i].second && init_fini_pairs[i + 1].second) {
+      FLAGS_libc_constructor = init_fini_pairs[i].first;
+      FLAGS_libc_destructor = init_fini_pairs[i + 1].first;
+      LOG(INFO) << "Deduced libc ctor/dtor to "
+                << FLAGS_libc_constructor << " / "
+                << FLAGS_libc_destructor;
+      return true;
+    }
+  }
+  return false;
 }
 
 // Generate code to call pre-`main` function static object constructors, and
 // post-`main` functions destructors.
 void CallInitFiniCode(const NativeModule *cfg_module) {
   if (FLAGS_libc_constructor.empty() && FLAGS_libc_destructor.empty()) {
-    return;
+    if (!DetectAndSetInitFiniCode(cfg_module)) {
+      return;
+    }
   }
 
   for (const auto &entry : cfg_module->ea_to_func) {
